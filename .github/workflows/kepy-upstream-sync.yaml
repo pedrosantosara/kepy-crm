@@ -1,0 +1,149 @@
+name: Kepy - Upstream sync
+
+# Traz as correcoes e novidades do twentyhq/twenty para o fork diariamente.
+# Merge limpo -> abre PR para revisao. Conflito -> abre issue com os arquivos.
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: kepy-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/twentyhq/twenty.git
+          git fetch upstream main --no-tags
+          git config user.name "kepy-sync"
+          git config user.email "kepy-sync@users.noreply.github.com"
+
+      - name: Check new upstream commits
+        id: check
+        run: |
+          COUNT=$(git rev-list --count main..upstream/main)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Commits novos no upstream: $COUNT"
+
+      - name: Merge upstream into sync branch
+        id: merge
+        if: steps.check.outputs.count != '0'
+        run: |
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -B "$BRANCH" main
+          if git merge upstream/main --no-edit -m "Merge upstream twentyhq/twenty main"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > conflicted.txt
+            git merge --abort
+          fi
+
+      - name: Build changelog
+        if: steps.check.outputs.count != '0'
+        run: |
+          {
+            echo "Commits novos do twentyhq/twenty: **${{ steps.check.outputs.count }}**"
+            echo
+            echo "### Correcoes (fix)"
+            git log --no-merges --pretty='- %s (%h)' main..upstream/main | grep -iE '^- (fix|hotfix|bug)|\bfix' | head -80 || echo "- nenhuma"
+            echo
+            echo "### Demais mudancas"
+            git log --no-merges --pretty='- %s (%h)' main..upstream/main | grep -viE '\bfix' | head -120 || true
+          } > changelog.md
+
+      - name: Open or update PR
+        id: pr
+        if: steps.check.outputs.count != '0' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          git push --force origin "$BRANCH"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --body-file changelog.md
+            echo "pr_number=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            URL=$(gh pr create --base main --head "$BRANCH" \
+              --title "Sync upstream twentyhq/twenty ($(date -u +%Y-%m-%d))" \
+              --body-file changelog.md --label upstream-sync 2>/dev/null \
+              || gh pr create --base main --head "$BRANCH" \
+              --title "Sync upstream twentyhq/twenty ($(date -u +%Y-%m-%d))" \
+              --body-file changelog.md)
+            echo "pr_number=${URL##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue on conflict
+        if: steps.check.outputs.count != '0' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "O merge automatico do upstream teve conflito nestes arquivos:"
+            echo
+            sed 's/^/- `/; s/$/`/' conflicted.txt
+            echo
+            echo "Resolva localmente:"
+            echo '```bash'
+            echo 'git fetch upstream && git checkout -b sync/manual main && git merge upstream/main'
+            echo '```'
+            echo
+            cat changelog.md
+          } > issue.md
+          TITLE="Conflito no sync com upstream ($(date -u +%Y-%m-%d))"
+          if ! gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' | grep -q .; then
+            gh issue create --title "$TITLE" --body-file issue.md
+          fi
+
+  review:
+    # Analise das mudancas do upstream com o Claude (usa a assinatura via CLAUDE_CODE_OAUTH_TOKEN).
+    needs: sync
+    if: needs.sync.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Check token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: echo "present=$([ -n "$TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.token.outputs.present == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Voce revisa o PR #${{ needs.sync.outputs.pr_number }} do repositorio ${{ github.repository }},
+            que traz commits novos do twentyhq/twenty para o fork kepy-crm.
+            1. Liste as correcoes de bugs e de seguranca relevantes e explique o impacto de cada uma.
+            2. Verifique se alguma mudanca afeta as customizacoes do Kepy (arquivos com "kepy" no caminho
+               e o provedor de IA claude-subscription em packages/twenty-server/src/engine/metadata-modules/ai).
+            3. Aponte riscos de upgrade (migrations, variaveis de ambiente novas, breaking changes).
+            Responda em portugues com um comentario no PR usando `gh pr comment`.
+          claude_args: '--allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git diff:*),Read,Grep,Glob"'
