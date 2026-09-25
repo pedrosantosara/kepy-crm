@@ -54,6 +54,8 @@ import { repairToolCall } from 'src/engine/metadata-modules/ai/ai-agent/utils/re
 import { AiBillingService } from 'src/engine/metadata-modules/ai/ai-billing/services/ai-billing.service';
 import { convertDollarsToCreditsMicro } from 'src/engine/metadata-modules/ai/ai-billing/utils/convert-dollars-to-credits-micro.util';
 import { countNativeWebSearchCallsFromSteps } from 'src/engine/metadata-modules/ai/ai-billing/utils/count-native-web-search-calls-from-steps.util';
+import { buildClaudeSubscriptionModel } from 'src/engine/metadata-modules/ai/ai-models/utils/build-claude-subscription-model.util';
+import { isClaudeSubscriptionLanguageModel } from 'src/engine/metadata-modules/ai/ai-models/utils/is-claude-subscription-language-model.util';
 import {
   extractCacheCreationTokens,
   extractCacheCreationTokensFromSteps,
@@ -541,13 +543,37 @@ export class ChatExecutionService {
       });
     };
 
+    // The subscription model runs its own tool loop inside the Claude Agent
+    // SDK, so Twenty's tools are handed over as an MCP server. Tools that
+    // pause the turn for the chat UI cannot pause that loop and stay out.
+    const isClaudeSubscriptionModel = isClaudeSubscriptionLanguageModel(
+      registeredModel.model,
+    );
+
+    const chatModel = isClaudeSubscriptionLanguageModel(registeredModel.model)
+      ? buildClaudeSubscriptionModel({
+          modelId: registeredModel.model.modelId,
+          tools: Object.fromEntries(
+            Object.entries(activeTools).filter(
+              ([toolName]) =>
+                toolName !== ASK_QUESTIONS_TOOL_NAME &&
+                toolName !== COMPLETE_WORKSPACE_SETUP_TOOL_NAME,
+            ),
+          ),
+          systemPrompt: systemMessage.content,
+        })
+      : registeredModel.model;
+
     const stream = streamText({
-      model: registeredModel.model,
-      instructions: systemMessage,
+      model: chatModel,
+      instructions: isClaudeSubscriptionModel ? undefined : systemMessage,
       messages: modelMessages,
-      tools: activeTools,
+      tools: isClaudeSubscriptionModel ? undefined : activeTools,
       // Every step of the kickoff turn is forced so it cannot end in prose; stopWhen ends it at the first ask_questions.
-      toolChoice: isWorkspaceSetupKickoffTurn ? 'required' : 'auto',
+      toolChoice:
+        isWorkspaceSetupKickoffTurn && !isClaudeSubscriptionModel
+          ? 'required'
+          : 'auto',
       abortSignal,
       stopWhen: (step) =>
         isStepCount(AGENT_CONFIG.MAX_STEPS)(step) ||
