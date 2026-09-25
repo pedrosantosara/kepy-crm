@@ -1,7 +1,7 @@
 name: Kepy - Upstream sync
 
 # Traz as correcoes e novidades do twentyhq/twenty para o fork diariamente.
-# Merge limpo -> abre PR para revisao. Conflito -> abre issue com os arquivos.
+# Merge limpo -> abre PR com o changelog. Conflito -> abre issue com os arquivos.
 on:
   schedule:
     - cron: '0 9 * * *'
@@ -19,8 +19,6 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,38 +110,3 @@ jobs:
           if ! gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' | grep -q .; then
             gh issue create --title "$TITLE" --body-file issue.md
           fi
-
-  review:
-    # Analise das mudancas do upstream com o Claude (usa a assinatura via CLAUDE_CODE_OAUTH_TOKEN).
-    needs: sync
-    if: needs.sync.outputs.pr_number != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write
-    steps:
-      - name: Check token
-        id: token
-        env:
-          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: echo "present=$([ -n "$TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v4
-        if: steps.token.outputs.present == 'true'
-        with:
-          fetch-depth: 0
-
-      - uses: anthropics/claude-code-action@v1
-        if: steps.token.outputs.present == 'true'
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            Voce revisa o PR #${{ needs.sync.outputs.pr_number }} do repositorio ${{ github.repository }},
-            que traz commits novos do twentyhq/twenty para o fork kepy-crm.
-            1. Liste as correcoes de bugs e de seguranca relevantes e explique o impacto de cada uma.
-            2. Verifique se alguma mudanca afeta as customizacoes do Kepy (arquivos com "kepy" no caminho
-               e o provedor de IA claude-subscription em packages/twenty-server/src/engine/metadata-modules/ai).
-            3. Aponte riscos de upgrade (migrations, variaveis de ambiente novas, breaking changes).
-            Responda em portugues com um comentario no PR usando `gh pr comment`.
-          claude_args: '--allowedTools "Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git diff:*),Read,Grep,Glob"'
